@@ -189,7 +189,10 @@ class InpaintCrop:
                max(x_min - x_grow_left, start_x),
                min(x_max + x_grow_right, start_x + initial_width - 1))
 
-    def inpaint_crop(self, image, mask, context_expand_pixels, context_expand_factor, fill_mask_holes, blur_mask_pixels, invert_mask, blend_pixels, mode, rescale_algorithm, force_width, force_height, rescale_factor, padding, min_width, min_height, max_width, max_height, auto_expand=False, optional2_context_mask=None):
+    def inpaint_crop(self, image, mask, context_expand_pixels, context_expand_factor, fill_mask_holes, 
+                    blur_mask_pixels, invert_mask, blend_pixels, mode, rescale_algorithm, force_width, 
+                    force_height, rescale_factor, padding, min_width, min_height, max_width, max_height, 
+                    auto_expand=False, optional2_context_mask=None):
         if image.shape[0] > 1:
             assert mode == "forced size", "Mode must be 'forced size' when input is a batch of images"
         assert image.shape[0] == mask.shape[0], "Batch size of images and masks must be the same"
