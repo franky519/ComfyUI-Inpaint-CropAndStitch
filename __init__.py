@@ -13,7 +13,7 @@ NODE_CLASS_MAPPINGS = {
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
-    "InpaintCrop": "✂️ Inpaint Crop",
+    "InpaintCrop": "✂️ Inpaint Crop_fnckc",
     "InpaintStitch": "✂️ Inpaint Stitch",
     "InpaintExtendOutpaint": "✂️ Extend Image for Outpainting",
     "InpaintResize": "✂️ Resize Image Before Inpainting",
