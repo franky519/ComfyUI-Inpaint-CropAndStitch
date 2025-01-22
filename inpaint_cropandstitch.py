@@ -47,9 +47,10 @@ class InpaintCrop:
                 "max_width": ("INT", {"default": 768, "min": 0, "max": nodes.MAX_RESOLUTION, "step": 1}), # ranged
                 "max_height": ("INT", {"default": 768, "min": 0, "max": nodes.MAX_RESOLUTION, "step": 1}), # ranged
                 "padding": ([8, 16, 32, 64, 128, 256, 512], {"default": 32}), # free and ranged
+                "auto_expand": ("BOOLEAN", {"default": False}),
            },
            "optional": {
-                "optional_context_mask": ("MASK",),
+                "optional2_context_mask": ("MASK",),
            }
         }
 
@@ -165,12 +166,35 @@ class InpaintCrop:
 
         return new_min_val, new_max_val
 
-    def inpaint_crop(self, image, mask, context_expand_pixels, context_expand_factor, fill_mask_holes, blur_mask_pixels, invert_mask, blend_pixels, mode, rescale_algorithm, force_width, force_height, rescale_factor, padding, min_width, min_height, max_width, max_height, optional_context_mask=None):
+    def calculate_safe_expansion(self, y_min, y_max, x_min, x_max, y_grow, x_grow, height, width, start_y, start_x, initial_height, initial_width, auto_expand):
+        """计算安全的扩展范围，避免不必要的图片扩展"""
+        if auto_expand:
+            return y_min - y_grow // 2, y_max + y_grow // 2, x_min - x_grow // 2, x_max + x_grow // 2
+        
+        # 计算遮罩区域到边界的距离
+        dist_to_top = y_min - start_y
+        dist_to_bottom = (start_y + initial_height) - y_max
+        dist_to_left = x_min - start_x
+        dist_to_right = (start_x + initial_width) - x_max
+        
+        # 计算实际可扩展的范围
+        # 如果遮罩区域接触边界，则该方向不进行扩展
+        y_grow_up = 0 if dist_to_top == 0 else min(y_grow // 2, dist_to_top)
+        y_grow_down = 0 if dist_to_bottom == 0 else min(y_grow // 2, dist_to_bottom)
+        x_grow_left = 0 if dist_to_left == 0 else min(x_grow // 2, dist_to_left)
+        x_grow_right = 0 if dist_to_right == 0 else min(x_grow // 2, dist_to_right)
+        
+        return (max(y_min - y_grow_up, start_y),
+               min(y_max + y_grow_down, start_y + initial_height - 1),
+               max(x_min - x_grow_left, start_x),
+               min(x_max + x_grow_right, start_x + initial_width - 1))
+
+    def inpaint_crop(self, image, mask, context_expand_pixels, context_expand_factor, fill_mask_holes, blur_mask_pixels, invert_mask, blend_pixels, mode, rescale_algorithm, force_width, force_height, rescale_factor, padding, min_width, min_height, max_width, max_height, auto_expand=False, optional2_context_mask=None):
         if image.shape[0] > 1:
             assert mode == "forced size", "Mode must be 'forced size' when input is a batch of images"
         assert image.shape[0] == mask.shape[0], "Batch size of images and masks must be the same"
-        if optional_context_mask is not None:
-            assert optional_context_mask.shape[0] == image.shape[0], "Batch size of optional_context_masks must be the same as images or None"
+        if optional2_context_mask is not None:
+            assert optional2_context_mask.shape[0] == image.shape[0], "Batch size of optional2_context_masks must be the same as images or None"
 
         result_stitch = {'x': [], 'y': [], 'original_image': [], 'cropped_mask_blend': [], 'rescale_x': [], 'rescale_y': [], 'start_x': [], 'start_y': [], 'initial_width': [], 'initial_height': []}
         results_image = []
@@ -180,11 +204,11 @@ class InpaintCrop:
         for b in range(batch_size):
             one_image = image[b].unsqueeze(0)
             one_mask = mask[b].unsqueeze(0)
-            one_optional_context_mask = None
-            if optional_context_mask is not None:
-                one_optional_context_mask = optional_context_mask[b].unsqueeze(0)
+            one_optional2_context_mask = None
+            if optional2_context_mask is not None:
+                one_optional2_context_mask = optional2_context_mask[b].unsqueeze(0)
 
-            stitch, cropped_image, cropped_mask = self.inpaint_crop_single_image(one_image, one_mask, context_expand_pixels, context_expand_factor, fill_mask_holes, blur_mask_pixels, invert_mask, blend_pixels, mode, rescale_algorithm, force_width, force_height, rescale_factor, padding, min_width, min_height, max_width, max_height, one_optional_context_mask)
+            stitch, cropped_image, cropped_mask = self.inpaint_crop_single_image(one_image, one_mask, context_expand_pixels, context_expand_factor, fill_mask_holes, blur_mask_pixels, invert_mask, blend_pixels, mode, rescale_algorithm, force_width, force_height, rescale_factor, padding, min_width, min_height, max_width, max_height, auto_expand, one_optional2_context_mask)
 
             for key in result_stitch:
                 result_stitch[key].append(stitch[key])
@@ -199,7 +223,7 @@ class InpaintCrop:
         return result_stitch, result_image, result_mask
        
     # Parts of this function are from KJNodes: https://github.com/kijai/ComfyUI-KJNodes
-    def inpaint_crop_single_image(self, image, mask, context_expand_pixels, context_expand_factor, fill_mask_holes, blur_mask_pixels, invert_mask, blend_pixels, mode, rescale_algorithm, force_width, force_height, rescale_factor, padding, min_width, min_height, max_width, max_height, optional_context_mask=None):
+    def inpaint_crop_single_image(self, image, mask, context_expand_pixels, context_expand_factor, fill_mask_holes, blur_mask_pixels, invert_mask, blend_pixels, mode, rescale_algorithm, force_width, force_height, rescale_factor, padding, min_width, min_height, max_width, max_height, auto_expand=False, optional2_context_mask=None):
         #Validate or initialize mask
         if mask.shape[1] != image.shape[1] or mask.shape[2] != image.shape[2]:
             non_zero_indices = torch.nonzero(mask[0], as_tuple=True)
@@ -233,16 +257,16 @@ class InpaintCrop:
             mask = 1.0 - mask
 
         # Validate or initialize context mask
-        if optional_context_mask is None:
+        if optional2_context_mask is None:
             context_mask = mask
-        elif optional_context_mask.shape[1] != image.shape[1] or optional_context_mask.shape[2] != image.shape[2]:
-            non_zero_indices = torch.nonzero(optional_context_mask[0], as_tuple=True)
+        elif optional2_context_mask.shape[1] != image.shape[1] or optional2_context_mask.shape[2] != image.shape[2]:
+            non_zero_indices = torch.nonzero(optional2_context_mask[0], as_tuple=True)
             if not non_zero_indices[0].size(0):
                 context_mask = mask
             else:
                 assert False, "context_mask size must match image size"
         else:
-            context_mask = optional_context_mask + mask 
+            context_mask = optional2_context_mask + mask 
             context_mask = torch.clamp(context_mask, 0.0, 1.0)
 
         # Ensure mask dimensions match image dimensions except channels
@@ -252,65 +276,69 @@ class InpaintCrop:
         assert initial_height == mask_height and initial_width == mask_width, "Image and mask dimensions must match"
         assert initial_height == context_mask_height and initial_width == context_mask_width, "Image and context mask dimensions must match"
 
-        # Extend image and masks to turn it into a big square in case the context area would go off bounds
-        extend_y = (initial_width + 1) // 2 # Intended, extend height by width (turn into square)
-        extend_x = (initial_height + 1) // 2 # Intended, extend width by height (turn into square)
-        new_height = initial_height + 2 * extend_y
-        new_width = initial_width + 2 * extend_x
+        # 修改扩展逻辑
+        if auto_expand:
+            # 扩展图像和遮罩以处理边界情况
+            extend_y = (initial_width + 1) // 2
+            extend_x = (initial_height + 1) // 2
+            new_height = initial_height + 2 * extend_y
+            new_width = initial_width + 2 * extend_x
+            start_y = extend_y
+            start_x = extend_x
 
-        start_y = extend_y
-        start_x = extend_x
+            available_top = min(start_y, initial_height)
+            available_bottom = min(new_height - (start_y + initial_height), initial_height)
+            available_left = min(start_x, initial_width)
+            available_right = min(new_width - (start_x + initial_width), initial_width)
 
-        available_top = min(start_y, initial_height)
-        available_bottom = min(new_height - (start_y + initial_height), initial_height)
-        available_left = min(start_x, initial_width)
-        available_right = min(new_width - (start_x + initial_width), initial_width)
+            new_image = torch.zeros((initial_batch, new_height, new_width, initial_channels), dtype=image.dtype)
+            new_image[:, start_y:start_y + initial_height, start_x:start_x + initial_width, :] = image
+            
+            # Mirror image so there's no bleeding of black border when using inpaintmodelconditioning
+            # Top
+            new_image[:, start_y - available_top:start_y, start_x:start_x + initial_width, :] = torch.flip(image[:, :available_top, :, :], [1])
+            # Bottom
+            new_image[:, start_y + initial_height:start_y + initial_height + available_bottom, start_x:start_x + initial_width, :] = torch.flip(image[:, -available_bottom:, :, :], [1])
+            # Left
+            new_image[:, start_y:start_y + initial_height, start_x - available_left:start_x, :] = torch.flip(new_image[:, start_y:start_y + initial_height, start_x:start_x + available_left, :], [2])
+            # Right
+            new_image[:, start_y:start_y + initial_height, start_x + initial_width:start_x + initial_width + available_right, :] = torch.flip(new_image[:, start_y:start_y + initial_height, start_x + initial_width - available_right:start_x + initial_width, :], [2])
+            # Corners...
+            # Top-left corner
+            new_image[:, start_y - available_top:start_y, start_x - available_left:start_x, :] = torch.flip(new_image[:, start_y:start_y + available_top, start_x:start_x + available_left, :], [1, 2])
+            # Top-right corner
+            new_image[:, start_y - available_top:start_y, start_x + initial_width:start_x + initial_width + available_right, :] = torch.flip(new_image[:, start_y:start_y + available_top, start_x + initial_width - available_right:start_x + initial_width, :], [1, 2])
+            # Bottom-left corner
+            new_image[:, start_y + initial_height:start_y + initial_height + available_bottom, start_x - available_left:start_x, :] = torch.flip(new_image[:, start_y + initial_height - available_bottom:start_y + initial_height, start_x:start_x + available_left, :], [1, 2])
+            # Bottom-right corner
+            new_image[:, start_y + initial_height:start_y + initial_height + available_bottom, start_x + initial_width:start_x + initial_width + available_right, :] = torch.flip(new_image[:, start_y + initial_height - available_bottom:start_y + initial_height, start_x + initial_width - available_right:start_x + initial_width, :], [1, 2])
 
-        new_image = torch.zeros((initial_batch, new_height, new_width, initial_channels), dtype=image.dtype)
-        new_image[:, start_y:start_y + initial_height, start_x:start_x + initial_width, :] = image
-        # Mirror image so there's no bleeding of black border when using inpaintmodelconditioning
-        # Top
-        new_image[:, start_y - available_top:start_y, start_x:start_x + initial_width, :] = torch.flip(image[:, :available_top, :, :], [1])
-        # Bottom
-        new_image[:, start_y + initial_height:start_y + initial_height + available_bottom, start_x:start_x + initial_width, :] = torch.flip(image[:, -available_bottom:, :, :], [1])
-        # Left
-        new_image[:, start_y:start_y + initial_height, start_x - available_left:start_x, :] = torch.flip(new_image[:, start_y:start_y + initial_height, start_x:start_x + available_left, :], [2])
-        # Right
-        new_image[:, start_y:start_y + initial_height, start_x + initial_width:start_x + initial_width + available_right, :] = torch.flip(new_image[:, start_y:start_y + initial_height, start_x + initial_width - available_right:start_x + initial_width, :], [2])
-        # Top-left corner
-        new_image[:, start_y - available_top:start_y, start_x - available_left:start_x, :] = torch.flip(new_image[:, start_y:start_y + available_top, start_x:start_x + available_left, :], [1, 2])
-        # Top-right corner
-        new_image[:, start_y - available_top:start_y, start_x + initial_width:start_x + initial_width + available_right, :] = torch.flip(new_image[:, start_y:start_y + available_top, start_x + initial_width - available_right:start_x + initial_width, :], [1, 2])
-        # Bottom-left corner
-        new_image[:, start_y + initial_height:start_y + initial_height + available_bottom, start_x - available_left:start_x, :] = torch.flip(new_image[:, start_y + initial_height - available_bottom:start_y + initial_height, start_x:start_x + available_left, :], [1, 2])
-        # Bottom-right corner
-        new_image[:, start_y + initial_height:start_y + initial_height + available_bottom, start_x + initial_width:start_x + initial_width + available_right, :] = torch.flip(new_image[:, start_y + initial_height - available_bottom:start_y + initial_height, start_x + initial_width - available_right:start_x + initial_width, :], [1, 2])
+            new_mask = torch.ones((mask_batch, new_height, new_width), dtype=mask.dtype)
+            new_mask[:, start_y:start_y + initial_height, start_x:start_x + initial_width] = mask
 
-        new_mask = torch.ones((mask_batch, new_height, new_width), dtype=mask.dtype) # assume ones in extended image
-        new_mask[:, start_y:start_y + initial_height, start_x:start_x + initial_width] = mask
+            blend_mask = torch.zeros((mask_batch, new_height, new_width), dtype=mask.dtype)
+            blend_mask[:, start_y:start_y + initial_height, start_x:start_x + initial_width] = mask
+            # Mirror blend mask borders...
+            blend_mask[:, start_y - available_top:start_y, start_x:start_x + initial_width] = torch.flip(mask[:, :available_top, :], [1])
+            blend_mask[:, start_y + initial_height:start_y + initial_height + available_bottom, start_x:start_x + initial_width] = torch.flip(mask[:, -available_bottom:, :], [1])
+            blend_mask[:, start_y:start_y + initial_height, start_x - available_left:start_x] = torch.flip(blend_mask[:, start_y:start_y + initial_height, start_x:start_x + available_left], [2])
+            blend_mask[:, start_y:start_y + initial_height, start_x + initial_width:start_x + initial_width + available_right] = torch.flip(blend_mask[:, start_y:start_y + initial_height, start_x + initial_width - available_right:start_x + initial_width], [2])
+            # Mirror blend mask corners...
+            blend_mask[:, start_y - available_top:start_y, start_x - available_left:start_x] = torch.flip(blend_mask[:, start_y:start_y + available_top, start_x:start_x + available_left], [1, 2])
+            blend_mask[:, start_y - available_top:start_y, start_x + initial_width:start_x + initial_width + available_right] = torch.flip(blend_mask[:, start_y:start_y + available_top, start_x + initial_width - available_right:start_x + initial_width], [1, 2])
+            blend_mask[:, start_y + initial_height:start_y + initial_height + available_bottom, start_x - available_left:start_x] = torch.flip(blend_mask[:, start_y + initial_height - available_bottom:start_y + initial_height, start_x:start_x + available_left], [1, 2])
+            blend_mask[:, start_y + initial_height:start_y + initial_height + available_bottom, start_x + initial_width:start_x + initial_width + available_right] = torch.flip(blend_mask[:, start_y + initial_height - available_bottom:start_y + initial_height, start_x + initial_width - available_right:start_x + initial_width], [1, 2])
 
-        blend_mask = torch.zeros((mask_batch, new_height, new_width), dtype=mask.dtype) # assume zeros in extended image
-        blend_mask[:, start_y:start_y + initial_height, start_x:start_x + initial_width] = mask
-        # Mirror blend mask so there's no bleeding of border when blending
-        # Top
-        blend_mask[:, start_y - available_top:start_y, start_x:start_x + initial_width] = torch.flip(mask[:, :available_top, :], [1])
-        # Bottom
-        blend_mask[:, start_y + initial_height:start_y + initial_height + available_bottom, start_x:start_x + initial_width] = torch.flip(mask[:, -available_bottom:, :], [1])
-        # Left
-        blend_mask[:, start_y:start_y + initial_height, start_x - available_left:start_x] = torch.flip(blend_mask[:, start_y:start_y + initial_height, start_x:start_x + available_left], [2])
-        # Right
-        blend_mask[:, start_y:start_y + initial_height, start_x + initial_width:start_x + initial_width + available_right] = torch.flip(blend_mask[:, start_y:start_y + initial_height, start_x + initial_width - available_right:start_x + initial_width], [2])
-        # Top-left corner
-        blend_mask[:, start_y - available_top:start_y, start_x - available_left:start_x] = torch.flip(blend_mask[:, start_y:start_y + available_top, start_x:start_x + available_left], [1, 2])
-        # Top-right corner
-        blend_mask[:, start_y - available_top:start_y, start_x + initial_width:start_x + initial_width + available_right] = torch.flip(blend_mask[:, start_y:start_y + available_top, start_x + initial_width - available_right:start_x + initial_width], [1, 2])
-        # Bottom-left corner
-        blend_mask[:, start_y + initial_height:start_y + initial_height + available_bottom, start_x - available_left:start_x] = torch.flip(blend_mask[:, start_y + initial_height - available_bottom:start_y + initial_height, start_x:start_x + available_left], [1, 2])
-        # Bottom-right corner
-        blend_mask[:, start_y + initial_height:start_y + initial_height + available_bottom, start_x + initial_width:start_x + initial_width + available_right] = torch.flip(blend_mask[:, start_y + initial_height - available_bottom:start_y + initial_height, start_x + initial_width - available_right:start_x + initial_width], [1, 2])
-
-        new_context_mask = torch.zeros((mask_batch, new_height, new_width), dtype=context_mask.dtype)
-        new_context_mask[:, start_y:start_y + initial_height, start_x:start_x + initial_width] = context_mask
+            new_context_mask = torch.zeros((mask_batch, new_height, new_width), dtype=context_mask.dtype)
+            new_context_mask[:, start_y:start_y + initial_height, start_x:start_x + initial_width] = context_mask
+        else:
+            # 不扩展边界，直接使用原始图像和遮罩
+            new_image = image
+            new_mask = mask
+            blend_mask = mask.clone()
+            new_context_mask = context_mask
+            start_y = 0
+            start_x = 0
 
         image = new_image
         mask = new_mask
@@ -342,10 +370,10 @@ class InpaintCrop:
         x_size = x_max - x_min + 1
         y_grow = round(max(y_size*(context_expand_factor-1), context_expand_pixels, blend_pixels**1.5))
         x_grow = round(max(x_size*(context_expand_factor-1), context_expand_pixels, blend_pixels**1.5))
-        y_min = max(y_min - y_grow // 2, 0)
-        y_max = min(y_max + y_grow // 2, height - 1)
-        x_min = max(x_min - x_grow // 2, 0)
-        x_max = min(x_max + x_grow // 2, width - 1)
+        y_min, y_max, x_min, x_max = self.calculate_safe_expansion(
+            y_min, y_max, x_min, x_max, y_grow, x_grow,
+            height, width, start_y, start_x, initial_height, initial_width, auto_expand
+        )
         y_size = y_max - y_min + 1
         x_size = x_max - x_min + 1
 
@@ -628,7 +656,7 @@ class InpaintExtendOutpaint:
                 "expand_right_factor": ("FLOAT", {"default": 1.0, "min": 1.0, "max": 100.0, "step": 0.01}),
             },
             "optional": {
-                "optional_context_mask": ("MASK",),
+                "optional2_context_mask": ("MASK",),
             }
         }
 
@@ -639,10 +667,10 @@ class InpaintExtendOutpaint:
 
     FUNCTION = "inpaint_extend"
 
-    def inpaint_extend(self, image, mask, mode, expand_up_pixels, expand_up_factor, expand_down_pixels, expand_down_factor, expand_left_pixels, expand_left_factor, expand_right_pixels, expand_right_factor, optional_context_mask=None):
+    def inpaint_extend(self, image, mask, mode, expand_up_pixels, expand_up_factor, expand_down_pixels, expand_down_factor, expand_left_pixels, expand_left_factor, expand_right_pixels, expand_right_factor, optional2_context_mask=None):
         assert image.shape[0] == mask.shape[0], "Batch size of images and masks must be the same"
-        if optional_context_mask is not None:
-            assert optional_context_mask.shape[0] == image.shape[0], "Batch size of optional_context_masks must be the same as images or None"
+        if optional2_context_mask is not None:
+            assert optional2_context_mask.shape[0] == image.shape[0], "Batch size of optional2_context_masks must be the same as images or None"
 
         results_image = []
         results_mask = []
@@ -653,8 +681,8 @@ class InpaintExtendOutpaint:
             one_image = image[b].unsqueeze(0)  # Adding batch dimension
             one_mask = mask[b].unsqueeze(0)    # Adding batch dimension
             one_context_mask = None
-            if optional_context_mask is not None:
-                one_context_mask = optional_context_mask[b].unsqueeze(0)
+            if optional2_context_mask is not None:
+                one_context_mask = optional2_context_mask[b].unsqueeze(0)
 
             #Validate or initialize mask
             if one_mask.shape[1] != one_image.shape[1] or one_mask.shape[2] != one_image.shape[2]:
@@ -753,7 +781,7 @@ class InpaintExtendOutpaint:
         output_image = torch.stack(results_image, dim=0)
         output_mask = torch.stack(results_mask, dim=0)
         output_context_mask = None
-        if optional_context_mask is not None:
+        if optional2_context_mask is not None:
             output_context_mask = torch.stack(results_context_mask, dim=0)
 
         return (output_image, output_mask, output_context_mask)
@@ -779,7 +807,7 @@ class InpaintResize:
                 "rescale_factor": ("FLOAT", {"default": 1.00, "min": 0.01, "max": 100.0, "step": 0.01}), # free
             },
             "optional": {
-                "optional_context_mask": ("MASK",),
+                "optional2_context_mask": ("MASK",),
             }
         }
 
@@ -790,10 +818,10 @@ class InpaintResize:
 
     FUNCTION = "inpaint_resize"
 
-    def inpaint_resize(self, image, mask, rescale_algorithm, mode, min_width, min_height, rescale_factor, optional_context_mask=None):
+    def inpaint_resize(self, image, mask, rescale_algorithm, mode, min_width, min_height, rescale_factor, optional2_context_mask=None):
         assert image.shape[0] == mask.shape[0], "Batch size of images and masks must be the same"
-        if optional_context_mask is not None:
-            assert optional_context_mask.shape[0] == image.shape[0], "Batch size of optional_context_masks must be the same as images or None"
+        if optional2_context_mask is not None:
+            assert optional2_context_mask.shape[0] == image.shape[0], "Batch size of optional2_context_masks must be the same as images or None"
 
         results_image = []
         results_mask = []
@@ -804,8 +832,8 @@ class InpaintResize:
             one_image = image[b].unsqueeze(0)  # Adding batch dimension
             one_mask = mask[b].unsqueeze(0)    # Adding batch dimension
             one_context_mask = None
-            if optional_context_mask is not None:
-                one_context_mask = optional_context_mask[b].unsqueeze(0)
+            if optional2_context_mask is not None:
+                one_context_mask = optional2_context_mask[b].unsqueeze(0)
 
             #Validate or initialize mask
             if one_mask.shape[1] != one_image.shape[1] or one_mask.shape[2] != one_image.shape[2]:
@@ -881,7 +909,7 @@ class InpaintResize:
         output_image = torch.stack(results_image, dim=0)
         output_mask = torch.stack(results_mask, dim=0)
         output_context_mask = None
-        if optional_context_mask is not None:
+        if optional2_context_mask is not None:
             output_context_mask = torch.stack(results_context_mask, dim=0)
 
         return (output_image, output_mask, output_context_mask)
